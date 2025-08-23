@@ -179,6 +179,25 @@ private:
 	
 	UPROPERTY(EditAnywhere, Category = "Performance Guards")
 	float ProxyRebuildBudgetMs = 3.0f;
+
+public:
+	// Flood Fill Detection Parameters - Editable at Runtime
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Island Detection", meta = (ClampMin = "1", ClampMax = "100"))
+	int32 SearchPadding = 50;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Island Detection", meta = (ClampMin = "10000", ClampMax = "5000000"))
+	int32 MaxFloodFillIterations = 500000;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Island Detection", meta = (ClampMin = "10000", ClampMax = "10000000"))
+	int32 MaxTotalVoxels = 5000000;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Island Detection", meta = (ClampMin = "1000", ClampMax = "100000"))
+	int32 MaxQuickScanVoxels = 10000;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Island Detection", meta = (ClampMin = "500.0", ClampMax = "5000.0"))
+	float TowerHeightLimit = 4000.0f;
+
+private:
 	
 	UPROPERTY()
 	TArray<int32> ProxyCookCounts;
@@ -222,4 +241,7 @@ private:
 	void LogVoxelDensities(AVoxelWorld* World, const FVoxelIntBox& Box, const FString& Stage);
 	void VerifyMaterialBinding(AVoxelWorld* World);
 	void DiagnoseMeshGenerationFailure(AVoxelWorld* World, const FVoxelIntBox& TestBox);
+	
+	// Copy island detection settings to a new falling world
+	void CopyIslandDetectionSettings(AVoxelWorld* FallingWorld);
 };
