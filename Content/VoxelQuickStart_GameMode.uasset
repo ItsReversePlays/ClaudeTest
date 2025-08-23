@@ -1,0 +1,12 @@
+Begin Object Class=/Script/Engine.Blueprint Name="VoxelQuickStart_GameMode" Archetype=/Script/Engine.Blueprint'/Engine/EditorBlueprintResources/StandardAssets.StandardAssets:Blueprint_0'
+   BlueprintSystemVersion=3
+   BlueprintType=BPTYPE_Normal
+   ParentClass=/Script/Engine.GameModeBase
+   BlueprintDisplayName="Voxel Quick Start Game Mode"
+   BlueprintDescription="Basic game mode for voxel testing with marching cubes"
+   
+   Begin Object Class=/Script/Engine.SimpleConstructionScript Name="SimpleConstructionScript_0"
+   End Object
+   SimpleConstructionScript=SimpleConstructionScript_0
+   
+End Object
