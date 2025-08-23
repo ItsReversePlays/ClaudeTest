@@ -40,6 +40,12 @@ void UVoxelIslandPhysics::BeginPlay()
 
 void UVoxelIslandPhysics::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	// Clean up mesh check timer
+	if (GetWorld() && MeshCheckTimerHandle.IsValid())
+	{
+		GetWorld()->GetTimerManager().ClearTimer(MeshCheckTimerHandle);
+	}
+	
 	// Cleanup falling voxel worlds
 	for (AVoxelWorld* FallingWorld : FallingVoxelWorlds)
 	{
@@ -89,7 +95,7 @@ void UVoxelIslandPhysics::CheckForDisconnectedIslands(AVoxelWorld* World, FVecto
 	FIntVector EditCenter = World->GlobalToLocal(EditLocation);
 	int32 VoxelRadius = FMath::CeilToInt(EditRadius / World->VoxelSize);
 	
-	// TOWER FIX: Extend bounds vertically to capture tall structures
+	// STRUCTURE FIX: Extend bounds to capture both tall and wide structures
 	// Standard spherical bounds
 	FIntVector EditMin = EditCenter - FIntVector(VoxelRadius);
 	FIntVector EditMax = EditCenter + FIntVector(VoxelRadius);
@@ -99,10 +105,17 @@ void UVoxelIslandPhysics::CheckForDisconnectedIslands(AVoxelWorld* World, FVecto
 	EditMin.Z = FMath::Min(EditMin.Z, EditCenter.Z - TowerHeightInVoxels);
 	EditMax.Z = FMath::Max(EditMax.Z, EditCenter.Z + TowerHeightInVoxels);
 	
-	UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Extended edit bounds - Min: %s, Max: %s (tower height in voxels: %d)"), 
-		*EditMin.ToString(), *EditMax.ToString(), TowerHeightInVoxels);
+	// Extend X,Y bounds for horizontal structures (convert HorizontalStructureLimit world units to voxel units)
+	int32 HorizontalStructureInVoxels = FMath::CeilToInt(HorizontalStructureLimit / World->VoxelSize);
+	EditMin.X = FMath::Min(EditMin.X, EditCenter.X - HorizontalStructureInVoxels);
+	EditMax.X = FMath::Max(EditMax.X, EditCenter.X + HorizontalStructureInVoxels);
+	EditMin.Y = FMath::Min(EditMin.Y, EditCenter.Y - HorizontalStructureInVoxels);
+	EditMax.Y = FMath::Max(EditMax.Y, EditCenter.Y + HorizontalStructureInVoxels);
 	
-	// Use proper island detection
+	UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Extended edit bounds - Min: %s, Max: %s (tower height: %d voxels, horizontal: %d voxels)"), 
+		*EditMin.ToString(), *EditMax.ToString(), TowerHeightInVoxels, HorizontalStructureInVoxels);
+	
+	// Use optimized synchronous detection with reduced search volume
 	TArray<FVoxelIsland> DetectedIslands = DetectIslands(World, EditMin, EditMax);
 	
 	// Process each island
@@ -115,7 +128,6 @@ void UVoxelIslandPhysics::CheckForDisconnectedIslands(AVoxelWorld* World, FVecto
 				Island.VoxelPositions.Num());
 			
 			CreateFallingVoxelWorld(World, Island, EditLocation);
-			// NOTE: RemoveIslandVoxels is called in CreateFallingVoxelWorld timer callback after copying
 		}
 		else if (Island.bIsGrounded)
 		{
@@ -138,138 +150,19 @@ TArray<FVoxelIsland> UVoxelIslandPhysics::DetectIslands(AVoxelWorld* World, cons
 		return Islands;
 	}
 
-	// ADAPTIVE PERFORMANCE: Choose search level based on context and potential structure size
-	FIntVector EditSize = EditMax - EditMin;
-	int32 MaxEditDimension = FMath::Max3(EditSize.X, EditSize.Y, EditSize.Z);
-	
-	UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: [TOWER DEBUG] Edit area: Min=(%d,%d,%d) Max=(%d,%d,%d) Size=(%d,%d,%d)"), 
-		EditMin.X, EditMin.Y, EditMin.Z, EditMax.X, EditMax.Y, EditMax.Z, EditSize.X, EditSize.Y, EditSize.Z);
-	
-	// Quick scan to detect if we're dealing with a potentially large structure
-	bool bPotentialLargeStructure = false;
-	int32 QuickScanPadding = 15; // Moderate padding for initial scan
-	FIntVector QuickScanMin = EditMin - FIntVector(QuickScanPadding);
-	FIntVector QuickScanMax = EditMax + FIntVector(QuickScanPadding);
-	
-	// Count solid voxels in a reasonable area to estimate structure complexity
-	int32 SolidVoxelCount = 0;
-	int64 QuickScanVolume = (int64)(QuickScanMax.X - QuickScanMin.X + 1) * (QuickScanMax.Y - QuickScanMin.Y + 1) * (QuickScanMax.Z - QuickScanMin.Z + 1);
-	
-	if (QuickScanVolume <= MaxQuickScanVoxels)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: [TOWER DEBUG] Quick scan bounds: Min=(%d,%d,%d) Max=(%d,%d,%d) Volume=%lld"), 
-			QuickScanMin.X, QuickScanMin.Y, QuickScanMin.Z, QuickScanMax.X, QuickScanMax.Y, QuickScanMax.Z, QuickScanVolume);
-		
-		FVoxelReadScopeLock QuickLock(World->GetData(), FVoxelIntBox(QuickScanMin, QuickScanMax), "QuickStructureScan");
-		int32 MaxFoundZ = INT32_MIN;
-		int32 MinFoundZ = INT32_MAX;
-		
-		for (int32 X = QuickScanMin.X; X <= QuickScanMax.X && SolidVoxelCount < 1000; X++)
-		{
-			for (int32 Y = QuickScanMin.Y; Y <= QuickScanMax.Y && SolidVoxelCount < 1000; Y++)
-			{
-				for (int32 Z = QuickScanMin.Z; Z <= QuickScanMax.Z && SolidVoxelCount < 1000; Z++)
-				{
-					FVoxelValue Value = World->GetData().GetValue(FIntVector(X, Y, Z), 0);
-					if (!Value.IsEmpty())
-					{
-						SolidVoxelCount++;
-						MaxFoundZ = FMath::Max(MaxFoundZ, Z);
-						MinFoundZ = FMath::Min(MinFoundZ, Z);
-						
-						// Check for tall structures by looking at Z distribution
-						if (Z - QuickScanMin.Z > 20) // If we find voxels more than 20 units up
-						{
-							bPotentialLargeStructure = true;
-							UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: [TOWER DEBUG] Found tall voxel at Z=%d (relative height=%d)"), Z, Z - QuickScanMin.Z);
-						}
-					}
-				}
-			}
-		}
-		
-		int32 ZSpread = MaxFoundZ - MinFoundZ;
-		UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: [TOWER DEBUG] Found %d solid voxels, Z spread: %d->%d (height=%d), PotentialLarge=%s"), 
-			SolidVoxelCount, MinFoundZ, MaxFoundZ, ZSpread, bPotentialLargeStructure ? TEXT("YES") : TEXT("NO"));
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: [TOWER DEBUG] Quick scan volume too large (%lld > %d), skipping structure detection"), QuickScanVolume, MaxQuickScanVoxels);
-	}
-	
-	// Determine appropriate search level - using editable parameters
-	int32 UsedSearchPadding;
-	int64 VoxelLimit;
-	int32 SelectedLevel;
-	
-	if (bPotentialLargeStructure || SolidVoxelCount > 500) // Detected complex/tall structure
-	{
-		UsedSearchPadding = SearchPadding; // Use full editable search padding
-		VoxelLimit = MaxTotalVoxels;
-		SelectedLevel = 2;
-		UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Using FULL search (detected large structure: %d solid voxels, tall=%s, padding=%d)"), 
-			SolidVoxelCount, bPotentialLargeStructure ? TEXT("YES") : TEXT("NO"), UsedSearchPadding);
-	}
-	else if (SolidVoxelCount > 100) // Medium complexity structure
-	{
-		UsedSearchPadding = FMath::Max(20, SearchPadding / 2); // Use half padding for medium structures
-		VoxelLimit = MaxTotalVoxels / 10;
-		SelectedLevel = 1;
-		UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Using BALANCED search (medium structure: %d solid voxels, padding=%d)"), SolidVoxelCount, UsedSearchPadding);
-	}
-	else // Simple/small structure
-	{
-		UsedSearchPadding = FMath::Max(5, SearchPadding / 10); // Use minimal padding for small structures
-		VoxelLimit = MaxTotalVoxels / 40;
-		SelectedLevel = 0;
-		UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Using FAST search (small structure: %d solid voxels, padding=%d)"), SolidVoxelCount, UsedSearchPadding);
-	}
-	
-	FIntVector SearchMin = EditMin - FIntVector(UsedSearchPadding);
-	FIntVector SearchMax = EditMax + FIntVector(UsedSearchPadding);
+	// Simple consistent approach: always use SearchPadding
+	FIntVector SearchMin = EditMin - FIntVector(SearchPadding);
+	FIntVector SearchMax = EditMax + FIntVector(SearchPadding);
 	int64 TotalVoxels = (int64)(SearchMax.X - SearchMin.X + 1) * (SearchMax.Y - SearchMin.Y + 1) * (SearchMax.Z - SearchMin.Z + 1);
 	
-	// Safety check - if still too big, reduce padding gradually
-	if (TotalVoxels > VoxelLimit)
+	// Safety check against MaxTotalVoxels
+	if (TotalVoxels > MaxTotalVoxels)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Initial search too large (%lld voxels), reducing padding"), TotalVoxels);
-		
-		// Try smaller paddings but don't go below minimum needed for towers
-		TArray<int32> FallbackPaddings;
-		// Generate fallback paddings based on the editable SearchPadding value
-		int32 BaseValue = FMath::Max(UsedSearchPadding, 15);
-		for (int32 i = BaseValue * 4 / 5; i >= 5; i -= FMath::Max(5, BaseValue / 10))
-		{
-			FallbackPaddings.Add(i);
-		}
-		bool bFoundGoodSize = false;
-		
-		for (int32 FallbackPadding : FallbackPaddings)
-		{
-			if (FallbackPadding < UsedSearchPadding) // Only reduce, never increase
-			{
-				SearchMin = EditMin - FIntVector(FallbackPadding);
-				SearchMax = EditMax + FIntVector(FallbackPadding);
-				TotalVoxels = (int64)(SearchMax.X - SearchMin.X + 1) * (SearchMax.Y - SearchMin.Y + 1) * (SearchMax.Z - SearchMin.Z + 1);
-				
-				if (TotalVoxels <= VoxelLimit)
-				{
-					UsedSearchPadding = FallbackPadding;
-					bFoundGoodSize = true;
-					UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Reduced to padding=%d, voxels=%lld"), FallbackPadding, TotalVoxels);
-					break;
-				}
-			}
-		}
-		
-		if (!bFoundGoodSize)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Could not find suitable search size, skipping island detection"), TotalVoxels);
-			return Islands;
-		}
+		UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Search volume too large (%lld > %d), skipping island detection"), TotalVoxels, MaxTotalVoxels);
+		return Islands;
 	}
 
-	UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Using search level %d - checking %lld voxels for islands"), SelectedLevel, TotalVoxels);
+	UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Checking %lld voxels for islands"), TotalVoxels);
 
 	// Get data lock for entire search area
 	FVoxelReadScopeLock Lock(World->GetData(), FVoxelIntBox(SearchMin, SearchMax), "IslandDetection");
@@ -277,44 +170,100 @@ TArray<FVoxelIsland> UVoxelIslandPhysics::DetectIslands(AVoxelWorld* World, cons
 	// Track all visited voxels
 	TSet<FIntVector> GlobalVisited;
 	
-	// Find all solid voxel positions in the area
-	TArray<FIntVector> SolidVoxels;
+	// SPATIAL CLUSTERING APPROACH - dramatically reduce island candidates
+	// Group nearby voxels into clusters first, then only flood-fill promising clusters
+	
+	const int32 ClusterSize = 16; // Voxel units per cluster (16*20cm = 3.2m resolution)
+	TMap<FIntVector, TArray<FIntVector>> VoxelClusters; // ClusterCoord -> VoxelsInCluster
+	
 	int32 CheckedVoxels = 0;
-	for (int32 X = SearchMin.X; X <= SearchMax.X; X++)
+	int32 HighZVoxels = 0;
+	
+	// Scan from TOP to BOTTOM to prioritize towers/bridges over ground
+	for (int32 Z = SearchMax.Z; Z >= SearchMin.Z; Z -= 2) // Skip every other Z level for speed
 	{
-		for (int32 Y = SearchMin.Y; Y <= SearchMax.Y; Y++)
+		for (int32 X = SearchMin.X; X <= SearchMax.X; X += 2) // Skip every other X
 		{
-			for (int32 Z = SearchMin.Z; Z <= SearchMax.Z; Z++)
+			for (int32 Y = SearchMin.Y; Y <= SearchMax.Y; Y += 2) // Skip every other Y
 			{
 				CheckedVoxels++;
-				// Reduce logging frequency for performance (scale with search level)
-				int32 LogInterval = SelectedLevel == 0 ? 2000 : (SelectedLevel == 1 ? 10000 : 25000);
-				if (CheckedVoxels % LogInterval == 0)
+				if (CheckedVoxels % 10000 == 0)
 				{
-					UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Checked %d voxels..."), CheckedVoxels);
+					UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Scanned %d voxels, %d clusters, %d high-Z"), 
+						CheckedVoxels, VoxelClusters.Num(), HighZVoxels);
 				}
 				
 				FIntVector Pos(X, Y, Z);
-				
-				// Skip voxels too close to ground level (likely floor geometry)
-				if (Z <= -200) // Skip anything below this level
-				{
-					continue;
-				}
-				
 				FVoxelValue Value = World->GetData().GetValue(Pos, 0);
 				if (!Value.IsEmpty())
 				{
-					SolidVoxels.Add(Pos);
+					// Track high-Z voxels
+					if (Z > -200)
+					{
+						HighZVoxels++;
+					}
+					
+					// Map voxel to cluster coordinates
+					FIntVector ClusterCoord(
+						Pos.X / ClusterSize,
+						Pos.Y / ClusterSize,
+						Pos.Z / ClusterSize
+					);
+					
+					// Add voxel to its cluster
+					VoxelClusters.FindOrAdd(ClusterCoord).Add(Pos);
 				}
+				
+				// Early termination - stop if too many clusters and insufficient elevated structure
+				if (VoxelClusters.Num() > 500)
+				{
+					if (HighZVoxels >= 100)
+					{
+						UE_LOG(LogTemp, Warning, TEXT("[SMART TERMINATION] Found %d clusters with %d high-Z voxels"), 
+							VoxelClusters.Num(), HighZVoxels);
+						break;
+					}
+				}
+			}
+			if (VoxelClusters.Num() > 500 && HighZVoxels >= 100) break;
+		}
+		if (VoxelClusters.Num() > 500 && HighZVoxels >= 100) break;
+	}
+	
+	UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Found %d clusters (reduced from potential millions of voxels)"), VoxelClusters.Num());
+	
+	// Convert promising clusters to seed points for flood fill
+	TArray<FIntVector> IslandSeeds;
+	for (const auto& ClusterPair : VoxelClusters)
+	{
+		const TArray<FIntVector>& ClusterVoxels = ClusterPair.Value;
+		
+		// Only process clusters with elevated voxels or reasonable size
+		bool HasElevatedVoxels = false;
+		for (const FIntVector& Voxel : ClusterVoxels)
+		{
+			if (Voxel.Z > -200)
+			{
+				HasElevatedVoxels = true;
+				break;
+			}
+		}
+		
+		// Use cluster center as seed point
+		if (HasElevatedVoxels || ClusterVoxels.Num() < 50) // Small clusters or elevated ones
+		{
+			if (ClusterVoxels.Num() > 0)
+			{
+				IslandSeeds.Add(ClusterVoxels[0]); // Use first voxel as seed
 			}
 		}
 	}
 	
-	UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Found %d solid voxels"), SolidVoxels.Num());
+	UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Processing %d island seeds (down from %d clusters)"), 
+		IslandSeeds.Num(), VoxelClusters.Num());
 
-	// Flood fill to find connected components
-	for (const FIntVector& StartPos : SolidVoxels)
+	// Flood fill to find connected components - now using smart seed points
+	for (const FIntVector& StartPos : IslandSeeds)
 	{
 		if (GlobalVisited.Contains(StartPos))
 		{
@@ -336,15 +285,15 @@ TArray<FVoxelIsland> UVoxelIslandPhysics::DetectIslands(AVoxelWorld* World, cons
 		};
 
 		int32 FloodFillIterations = 0;
-		// Scale flood fill iterations based on selected search level using editable parameter
-		const int32 UsedMaxFloodFillIterations = SelectedLevel == 0 ? (MaxFloodFillIterations / 50) : (SelectedLevel == 1 ? (MaxFloodFillIterations / 5) : MaxFloodFillIterations);
+		// Use simple MaxFloodFillIterations limit
+		const int32 UsedMaxFloodFillIterations = MaxFloodFillIterations;
 		
-		while (Queue.Num() > 0 && FloodFillIterations < UsedMaxFloodFillIterations)
+		while (Queue.Num() > 0 && FloodFillIterations < UsedMaxFloodFillIterations && IslandVoxels.Num() <= MaxIslandVoxels)
 		{
 			FloodFillIterations++;
-			if (FloodFillIterations % 2000 == 0)
+			if (FloodFillIterations % 5000 == 0)
 			{
-				UE_LOG(LogTemp, Warning, TEXT("Flood fill iteration %d, queue size: %d"), FloodFillIterations, Queue.Num());
+				UE_LOG(LogTemp, Warning, TEXT("Flood fill iteration %d, island size: %d, queue: %d"), FloodFillIterations, IslandVoxels.Num(), Queue.Num());
 			}
 			
 			FIntVector Current = Queue.Pop();
@@ -378,9 +327,16 @@ TArray<FVoxelIsland> UVoxelIslandPhysics::DetectIslands(AVoxelWorld* World, cons
 			}
 		}
 		
-		if (FloodFillIterations >= UsedMaxFloodFillIterations)
+		// Check termination reasons
+		if (IslandVoxels.Num() > MaxIslandVoxels)
 		{
-			UE_LOG(LogTemp, Error, TEXT("[LARGE ISLAND] Flood fill hit iteration limit (%d), island may be incomplete! Voxels found: %d"), 
+			UE_LOG(LogTemp, Warning, TEXT("[SKIPPING LARGE ISLAND] Island too large (%d voxels > %d limit), likely terrain/ground - ignoring"), 
+				IslandVoxels.Num(), MaxIslandVoxels);
+			continue; // Skip this island entirely - likely connected ground/terrain
+		}
+		else if (FloodFillIterations >= UsedMaxFloodFillIterations)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[ISLAND TRUNCATED] Flood fill hit iteration limit (%d), island may be incomplete! Voxels found: %d"), 
 				UsedMaxFloodFillIterations, IslandVoxels.Num());
 			// Continue processing the partial island rather than abandoning it completely
 		}
@@ -2618,5 +2574,6 @@ void UVoxelIslandPhysics::CopyIslandDetectionSettings(AVoxelWorld* FallingWorld)
 	UE_LOG(LogTemp, Warning, TEXT("[CopyIslandDetectionSettings] Copied settings: SearchPadding=%d, MaxFloodFill=%d, MaxTotalVoxels=%d, MaxQuickScan=%d"), 
 		FallingPhysics->SearchPadding, FallingPhysics->MaxFloodFillIterations, FallingPhysics->MaxTotalVoxels, FallingPhysics->MaxQuickScanVoxels);
 }
+
 
 
