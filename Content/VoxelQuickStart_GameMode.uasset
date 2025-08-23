@@ -1,12 +1,3 @@
-Begin Object Class=/Script/Engine.Blueprint Name="VoxelQuickStart_GameMode" Archetype=/Script/Engine.Blueprint'/Engine/EditorBlueprintResources/StandardAssets.StandardAssets:Blueprint_0'
-   BlueprintSystemVersion=3
-   BlueprintType=BPTYPE_Normal
-   ParentClass=/Script/Engine.GameModeBase
-   BlueprintDisplayName="Voxel Quick Start Game Mode"
-   BlueprintDescription="Basic game mode for voxel testing with marching cubes"
-   
-   Begin Object Class=/Script/Engine.SimpleConstructionScript Name="SimpleConstructionScript_0"
-   End Object
-   SimpleConstructionScript=SimpleConstructionScript_0
-   
-End Object
+version https://git-lfs.github.com/spec/v1
+oid sha256:8dc7e0abfbd25c7d500b84ac0a8f78cd439052c0cd324a5572a47fa9ad83e759
+size 606
