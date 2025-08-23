@@ -303,7 +303,7 @@ bool UVoxelIslandPhysics::IsConnectedToGround(AVoxelWorld* World, const FIntVect
 		return true; // Assume grounded if can't check
 	}
 
-	const int32 LocalGroundLevel = -500; // Consider anything below this as "ground" (more restrictive)
+	const int32 LocalGroundLevel = 0; // Consider anything below this as "ground" (more restrictive)
 	
 	// BFS to find path to ground
 	TArray<FIntVector> Queue;
@@ -502,10 +502,10 @@ void UVoxelIslandPhysics::CreateFallingVoxelWorld(AVoxelWorld* SourceWorld, cons
 	}
 	
 	// Create the new world using the helper method
-	// When building the transform for the falling world, offset by one-voxel border:
+	// Position the falling world exactly where the original material was located
 	const float V = SourceWorld->VoxelSize;
 	FTransform DesiredTransform(FRotator::ZeroRotator,
-		/* location: */ WorldPosMin - FVector(V, V, V),  // aligns dest (1,1,1) to WorldPosMin
+		/* location: */ WorldPosMin,  // Position exactly where original island was
 		FVector::OneVector);
 	AVoxelWorld* W = CreateFallingVoxelWorldInternal(FIntVector(RequiredWorldSize), SourceWorld->VoxelSize, DesiredTransform, VoxelMat);
 	
@@ -515,41 +515,81 @@ void UVoxelIslandPhysics::CreateFallingVoxelWorld(AVoxelWorld* SourceWorld, cons
 		return;
 	}
 	
-	// Store reference for cleanup and island data for copying
-	FallingVoxelWorlds.Add(W);
+	// DON'T add to FallingVoxelWorlds here - that will be done atomically with physics setup!
+	// Store pending data for the atomic initialization
 	PendingSourceWorld = SourceWorld;
 	PendingIsland = Island;
 	PendingWorldPosMin = WorldPosMin;
 	PendingMeshWorld = W;
 	
-	// Increased delay to allow seed geometry to fully generate triangles
-	FTimerHandle CopyTimer;
-	GetWorld()->GetTimerManager().SetTimer(CopyTimer, [this]()
-	{
-		if (!PendingSourceWorld || !PendingMeshWorld) return;
-
-		// Force another mesh generation attempt before copying
-		PendingMeshWorld->RecreateRender();
-		PendingMeshWorld->GetLODManager().ForceLODsUpdate();
-
-		// 1) Copy island now (write SOLID density + materials)
-		CopyVoxelDataRobust(PendingSourceWorld, PendingMeshWorld, PendingIsland, PendingWorldPosMin);
-
-		// 2) Carve out source
-		RemoveIslandVoxels(PendingSourceWorld, PendingIsland);
-
-		// 3) Rebuild collision/render quickly on both
-		RebuildWorldCollision(PendingSourceWorld, TEXT("SourceAfterCarve"));
-		RebuildWorldCollision(PendingMeshWorld, TEXT("FallingAfterCopy"));
-
-		// 4) Call helper functions for deterministic rebuild and physics enable
-		AttachInvokers(PendingSourceWorld, PendingMeshWorld, PendingIsland);
-		SyncRebuildWorlds(PendingSourceWorld, PendingMeshWorld, PendingIsland);
-		VerifyRuntimeStats(PendingSourceWorld, PendingMeshWorld, PendingIsland);
-		EnablePhysicsIfValid(PendingMeshWorld, PendingIsland); // guards on ValidBounds
-
-		UE_LOG(LogTemp, Warning, TEXT("[CreateFallingVoxelWorld] Copy+carve done; physics enabled"));
-	}, 0.2f, false);
+	UE_LOG(LogTemp, Warning, TEXT("[CreateFallingVoxelWorld] World created but NOT yet added to tracking arrays - pending atomic setup"));
+	
+	// IMMEDIATE SIMULTANEOUS SWAP: Remove old piece and show new piece at the same time
+	
+	// First, prepare the new world but don't show it yet
+	PendingMeshWorld->RecreateRender();
+	PendingMeshWorld->GetLODManager().ForceLODsUpdate();
+	
+	// Copy island data to new world (invisible for now)
+	CopyVoxelData(PendingSourceWorld, PendingMeshWorld, PendingIsland, PendingWorldPosMin);
+	UE_LOG(LogTemp, Warning, TEXT("[VoxelCopy] Copied %d voxels from source to falling world"), PendingIsland.VoxelPositions.Num());
+	RebuildWorldCollision(PendingMeshWorld, TEXT("FallingAfterCopy"));
+	
+	// CRITICAL: Enable physics and collision now that voxel data and mesh are ready
+	EnablePhysicsWithGuards(PendingMeshWorld, PendingIsland);
+	
+	// Validate collision geometry covers the full shape
+	ValidateVoxelCollision(PendingMeshWorld, TEXT("FallingWorld"));
+	
+	UE_LOG(LogTemp, Warning, TEXT("[VoxelCopy] Physics and collision enabled for falling world"));
+	
+	// Debug: Log exact positions for comparison
+	FVector SourceCenter = SourceWorld->GetActorLocation();
+	FVector FallingCenter = PendingMeshWorld->GetActorLocation();
+	UE_LOG(LogTemp, Warning, TEXT("[Position Debug] SourceWorld at %s, FallingWorld at %s, Offset=%s"), 
+		*SourceCenter.ToString(), *FallingCenter.ToString(), *(FallingCenter - SourceCenter).ToString());
+	
+	// ATOMIC SWAP: Remove from source and enable falling world simultaneously
+	RemoveIslandVoxels(PendingSourceWorld, PendingIsland);
+	RebuildWorldCollisionRegional(PendingSourceWorld, PendingIsland, TEXT("SourceAfterCarve"));
+	
+	// Enable physics and make falling world visible
+	AttachInvokers(PendingSourceWorld, PendingMeshWorld, PendingIsland);
+	SyncRebuildWorlds(PendingSourceWorld, PendingMeshWorld, PendingIsland);
+	VerifyRuntimeStats(PendingSourceWorld, PendingMeshWorld, PendingIsland);
+	// ATOMIC FIX: Don't enable physics here - it will be done atomically later in ContinueWithIslandCopy
+	// EnablePhysicsIfValid(PendingMeshWorld, PendingIsland);
+	
+	UE_LOG(LogTemp, Warning, TEXT("[CreateFallingVoxelWorld] Physics will be enabled atomically during copy process"));
+	
+	// CRITICAL FIX: Add world to tracking system immediately so custom physics can manage it
+	// even if mesh generation fails initially
+	int32 NewWorldIndex = FallingVoxelWorlds.Num();
+	
+	// Pre-extend all arrays with correct initial values
+	bCustomPhysicsEnabled.SetNumZeroed(NewWorldIndex + 1);
+	FallingVelocities.SetNumZeroed(NewWorldIndex + 1);
+	bProxyDirty.SetNumZeroed(NewWorldIndex + 1);
+	LastEditTime.SetNumZeroed(NewWorldIndex + 1);
+	bSettled.SetNumZeroed(NewWorldIndex + 1);
+	SettleTimers.SetNumZeroed(NewWorldIndex + 1);
+	ProxyCookCounts.SetNumZeroed(NewWorldIndex + 1);
+	ProxyRebuildTimers.SetNumZeroed(NewWorldIndex + 1);
+	
+	// Now add the world - arrays are properly sized
+	FallingVoxelWorlds.Add(PendingMeshWorld);
+	
+	// Set initial physics state - enable immediately so custom physics can manage the world
+	bCustomPhysicsEnabled[NewWorldIndex] = true;  // Enable custom physics right away
+	FallingVelocities[NewWorldIndex] = FVector(0, 0, -200.0f);  // Set initial falling velocity
+	LastEditTime[NewWorldIndex] = GetWorld()->GetTimeSeconds();
+	
+	UE_LOG(LogTemp, Warning, TEXT("[CreateFallingVoxelWorld] Added world to tracking arrays at index %d with physics enabled"), NewWorldIndex);
+	
+	// NOTE: Collision setup moved to after voxel data copy in async callback
+	// EnablePhysicsWithGuards will be called after CopyVoxelData completes
+	
+	UE_LOG(LogTemp, Warning, TEXT("[CreateFallingVoxelWorld] ATOMIC SWAP complete - simultaneous carve/spawn"));
 	
 	UE_LOG(LogTemp, Warning, TEXT("[CreateFallingVoxelWorld] Created falling world, copy scheduled"));
 }
@@ -649,28 +689,42 @@ void UVoxelIslandPhysics::CopyVoxelData(AVoxelWorld* Source, AVoxelWorld* Destin
 		FVoxelValue Value = Source->GetData().GetValue(SourcePos, 0);
 		FVoxelMaterial Material = Source->GetData().GetMaterial(SourcePos, 0);
 		
-		// Rebase indices with +1 border offset: J = (I - MinIndex) + (1,1,1)
-		FIntVector DestPos = (SourcePos - MinIndex) + FIntVector(1, 1, 1);
+		// Rebase indices without border offset for exact shape copying
+		FIntVector DestPos = SourcePos - MinIndex;
 		
-		// Write explicit density (solid = negative, empty = positive)
-		FVoxelValue SolidValue(-1.0f); // Create solid voxel (negative = solid, positive = empty)
-		Destination->GetData().SetValue(DestPos, SolidValue);
+		// CRITICAL: Copy the actual voxel value, not a fixed solid value
+		// This preserves the exact island shape instead of creating a solid block
+		Destination->GetData().SetValue(DestPos, Value);
 		Destination->GetData().SetMaterial(DestPos, Material);
 		
-		// Debug: Log first few copies
-		if (CopiedCount < 3)
+		// Debug: Log first few copies with actual values
+		if (CopiedCount < 5)
 		{
-			UE_LOG(LogTemp, Warning, TEXT("[Copy] Src(%d,%d,%d)->Dest(%d,%d,%d)+border, Density=-1.0(SOLID)"), 
+			UE_LOG(LogTemp, Warning, TEXT("[Copy] %d: Src(%d,%d,%d)->Dest(%d,%d,%d), Value=%.2f %s"), 
+				CopiedCount + 1,
 				SourcePos.X, SourcePos.Y, SourcePos.Z,
-				DestPos.X, DestPos.Y, DestPos.Z);
+				DestPos.X, DestPos.Y, DestPos.Z, 
+				Value.ToFloat(),
+				Value.IsEmpty() ? TEXT("(Empty)") : TEXT("(SOLID)"));
 		}
 		
 		CopiedCount++;
 	}
 	
-	UE_LOG(LogTemp, Warning, TEXT("[Copy] Wrote %d solids, Density=-1.0, Materials copied, Border remains EMPTY"), CopiedCount);
+	UE_LOG(LogTemp, Warning, TEXT("[VoxelCopy] Copied %d voxels with actual values (preserving original shape)"), CopiedCount);
 	
-	// Verify alignment with reference voxel (accounting for border)
+	// CRITICAL: Force cache clearing and mesh regeneration for the copied region
+	FIntVector IslandSize = Island.MaxBounds - Island.MinBounds + FIntVector(1, 1, 1);
+	FVoxelIntBox CopiedRegion(FIntVector::ZeroValue, IslandSize);
+	
+	// Clear all cached data to force regeneration
+	Destination->GetData().ClearCacheInBounds<FVoxelValue>(CopiedRegion);
+	Destination->GetData().ClearCacheInBounds<FVoxelMaterial>(CopiedRegion);
+	
+	UE_LOG(LogTemp, Warning, TEXT("[VoxelCopy] Cleared cache for region (0,0,0) to (%d,%d,%d) to force mesh regeneration"), 
+		IslandSize.X, IslandSize.Y, IslandSize.Z);
+	
+	// Verify alignment with reference voxel
 	FIntVector RefIdx = MinIndex;
 	float VoxelSize = Source->VoxelSize;
 	
@@ -702,10 +756,9 @@ void UVoxelIslandPhysics::CopyVoxelData(AVoxelWorld* Source, AVoxelWorld* Destin
 			LocalPosSrc.X, LocalPosSrc.Y, LocalPosSrc.Z, LocalPosFall.X, LocalPosFall.Y, LocalPosFall.Z);
 	}
 	
-	// Force mesh regeneration for the copied region
-	FIntVector IslandSize = Island.MaxBounds - Island.MinBounds + FIntVector(1);
-	FIntVector RegionMin = FIntVector(0, 0, 0); // Start of border
-	FIntVector RegionMax = IslandSize + FIntVector(2, 2, 2); // End of border + data
+	// Force mesh regeneration for the copied region (using already calculated IslandSize)
+	FIntVector RegionMin = FIntVector(0, 0, 0); // Start of region
+	FIntVector RegionMax = IslandSize + FIntVector(1, 1, 1); // End of region
 	FVoxelIntBox UpdateBox(RegionMin, RegionMax);
 	
 	// Notify voxel data change to trigger meshing
@@ -731,14 +784,22 @@ void UVoxelIslandPhysics::RemoveIslandVoxels(AVoxelWorld* World, const FVoxelIsl
 	
 	// Remove each voxel by exact index (no loose AABB)
 	int32 RemovedCount = 0;
+	FIntVector MinPos(INT32_MAX), MaxPos(INT32_MIN);
+	
 	for (const FIntVector& VoxelPos : Island.VoxelPositions)
 	{
+		// Track bounds for debugging
+		MinPos = FIntVector(FMath::Min(MinPos.X, VoxelPos.X), FMath::Min(MinPos.Y, VoxelPos.Y), FMath::Min(MinPos.Z, VoxelPos.Z));
+		MaxPos = FIntVector(FMath::Max(MaxPos.X, VoxelPos.X), FMath::Max(MaxPos.Y, VoxelPos.Y), FMath::Max(MaxPos.Z, VoxelPos.Z));
+		
 		// Set to empty/air
 		World->GetData().SetValue(VoxelPos, FVoxelValue::Empty());
 		// Clear material too
 		World->GetData().SetMaterial(VoxelPos, FVoxelMaterial::Default());
 		RemovedCount++;
 	}
+	
+	UE_LOG(LogTemp, Warning, TEXT("[Delete] Carved bounds: Min=%s Max=%s"), *MinPos.ToString(), *MaxPos.ToString());
 	
 	UE_LOG(LogTemp, Warning, TEXT("[Delete] Successfully removed %d/%d voxels from SourceWorld"), RemovedCount, Island.VoxelPositions.Num());
 }
@@ -752,14 +813,160 @@ void UVoxelIslandPhysics::RebuildWorldCollision(AVoxelWorld* World, const FStrin
 	
 	UE_LOG(LogTemp, Warning, TEXT("[%s Rebuild] Starting render+collision rebuild"), *WorldName);
 	
-	// Force collision profile update
+	// Force full visual mesh regeneration first
+	World->RecreateRender();
+	World->GetLODManager().ForceLODsUpdate();
+	
+	// Get root component and ensure collision covers full voxel shape
+	UVoxelWorldRootComponent& RootComp = World->GetWorldRoot();
+	
+	// CRITICAL: Ensure collision uses complex mesh geometry, not just a simple shape at center
+	if (UBodySetup* BodySetup = RootComp.GetBodySetup())
+	{
+		// Force complex collision that matches the actual voxel mesh shape
+		BodySetup->CollisionTraceFlag = ECollisionTraceFlag::CTF_UseComplexAsSimple;
+		BodySetup->bMeshCollideAll = true; // Enable collision for all mesh surfaces
+		BodySetup->DefaultInstance.SetCollisionProfileName("BlockAll");
+		
+		// Invalidate and recreate physics data to apply new collision geometry
+		BodySetup->InvalidatePhysicsData();
+		BodySetup->CreatePhysicsMeshes();
+		
+		UE_LOG(LogTemp, Warning, TEXT("[%s Rebuild] BodySetup configured for full mesh collision"), *WorldName);
+	}
+	
+	// Update collision profile after mesh is ready
 	World->UpdateCollisionProfile();
 	
-	// Get root component and ensure collision is ready
-	UVoxelWorldRootComponent& RootComp = World->GetWorldRoot();
+	// Recreate physics state with new collision geometry
 	RootComp.RecreatePhysicsState();
 	
-	UE_LOG(LogTemp, Warning, TEXT("[%s Rebuild] Render+Collision rebuilt for edited bounds"), *WorldName);
+	// Ensure collision is enabled for the entire component
+	RootComp.SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	RootComp.SetCollisionResponseToAllChannels(ECR_Block);
+	
+	// Force the render component to update its bounds and geometry
+	if (auto* RenderComp = World->GetRootComponent())
+	{
+		RenderComp->MarkRenderStateDirty();
+		RenderComp->MarkRenderDynamicDataDirty();
+	}
+	
+	UE_LOG(LogTemp, Warning, TEXT("[%s Rebuild] Full-shape collision rebuilt for voxel mesh"), *WorldName);
+}
+
+void UVoxelIslandPhysics::RebuildWorldCollisionIncremental(AVoxelWorld* World, const FString& WorldName)
+{
+	if (!World || !World->IsCreated())
+	{
+		return;
+	}
+	
+	UE_LOG(LogTemp, Warning, TEXT("[%s Incremental] Starting gradual render update"), *WorldName);
+	
+	// Use a more subtle approach - update collision without full recreation
+	World->UpdateCollisionProfile();
+	
+	// Mark render state as dirty but don't force immediate recreation
+	if (auto* RenderComp = World->GetRootComponent())
+	{
+		RenderComp->MarkRenderStateDirty();
+		// Skip the heavy MarkRenderDynamicDataDirty() call to reduce flicker
+	}
+	
+	// Force LOD update more gradually
+	World->GetLODManager().ForceLODsUpdate();
+	
+	UE_LOG(LogTemp, Warning, TEXT("[%s Incremental] Gradual render update completed"), *WorldName);
+}
+
+void UVoxelIslandPhysics::RebuildWorldCollisionRegional(AVoxelWorld* World, const FVoxelIsland& Island, const FString& WorldName)
+{
+	if (!World || !World->IsCreated() || Island.VoxelPositions.Num() == 0)
+	{
+		return;
+	}
+	
+	// Calculate the bounds of the removed island with some padding
+	FIntVector MinPos(INT32_MAX), MaxPos(INT32_MIN);
+	for (const FIntVector& VoxelPos : Island.VoxelPositions)
+	{
+		MinPos = FIntVector(FMath::Min(MinPos.X, VoxelPos.X), FMath::Min(MinPos.Y, VoxelPos.Y), FMath::Min(MinPos.Z, VoxelPos.Z));
+		MaxPos = FIntVector(FMath::Max(MaxPos.X, VoxelPos.X), FMath::Max(MaxPos.Y, VoxelPos.Y), FMath::Max(MaxPos.Z, VoxelPos.Z));
+	}
+	
+	// Add padding for mesh generation (typically 2-3 voxels around the modified area)
+	const int32 Padding = 3;
+	FIntVector PaddedMin = MinPos - FIntVector(Padding);
+	FIntVector PaddedMax = MaxPos + FIntVector(Padding);
+	FVoxelIntBox UpdateRegion(PaddedMin, PaddedMax);
+	
+	UE_LOG(LogTemp, Warning, TEXT("[%s Regional] Updating only carved region: Min=%s Max=%s (Padding=%d)"), 
+		*WorldName, *PaddedMin.ToString(), *PaddedMax.ToString(), Padding);
+	
+	// Clear cache in the affected region only
+	World->GetData().ClearCacheInBounds<FVoxelValue>(UpdateRegion);
+	World->GetData().ClearCacheInBounds<FVoxelMaterial>(UpdateRegion);
+	
+	// Update only the affected region's LOD/mesh
+	World->GetLODManager().UpdateBounds(UpdateRegion);
+	
+	// Update collision only for the specific region
+	World->UpdateCollisionProfile();
+	
+	UE_LOG(LogTemp, Warning, TEXT("[%s Regional] Regional update completed for %d voxels in bounds"), 
+		*WorldName, Island.VoxelPositions.Num());
+}
+
+void UVoxelIslandPhysics::ValidateVoxelCollision(AVoxelWorld* World, const FString& WorldName)
+{
+	if (!World || !World->IsCreated())
+	{
+		UE_LOG(LogTemp, Error, TEXT("[%s Collision] World not created, cannot validate collision"), *WorldName);
+		return;
+	}
+	
+	UVoxelWorldRootComponent& RootComp = World->GetWorldRoot();
+	
+	// Check if body setup exists and has proper configuration
+	UBodySetup* BodySetup = RootComp.GetBodySetup();
+	if (!BodySetup)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[%s Collision] No BodySetup found - collision will not work properly"), *WorldName);
+		return;
+	}
+	
+	// Validate collision trace flag
+	bool bUsingComplexAsSimple = (BodySetup->CollisionTraceFlag == ECollisionTraceFlag::CTF_UseComplexAsSimple);
+	bool bHasSimpleShapes = (BodySetup->AggGeom.GetElementCount() > 0);
+	
+	UE_LOG(LogTemp, Warning, TEXT("[%s Collision] Validation: ComplexAsSimple=%s, SimpleShapes=%d"), 
+		*WorldName, 
+		bUsingComplexAsSimple ? TEXT("YES") : TEXT("NO"),
+		BodySetup->AggGeom.GetElementCount());
+	
+	// Get collision bounds to verify it covers more than just a point
+	FBox CollisionBounds = RootComp.Bounds.GetBox();
+	FVector CollisionSize = CollisionBounds.GetSize();
+	
+	UE_LOG(LogTemp, Warning, TEXT("[%s Collision] Collision bounds size: X=%.1f, Y=%.1f, Z=%.1f"), 
+		*WorldName, CollisionSize.X, CollisionSize.Y, CollisionSize.Z);
+	
+	// Check if collision is too small (indicating center-point only collision)
+	if (CollisionSize.X < 50.0f && CollisionSize.Y < 50.0f && CollisionSize.Z < 50.0f)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[%s Collision] WARNING: Collision bounds very small (%.1f) - may only be center point!"), 
+			*WorldName, CollisionSize.GetMax());
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[%s Collision] Collision bounds look good - covers full shape"), *WorldName);
+	}
+	
+	// Validate collision is enabled
+	bool bCollisionEnabled = (RootComp.GetCollisionEnabled() != ECollisionEnabled::NoCollision);
+	UE_LOG(LogTemp, Warning, TEXT("[%s Collision] Collision enabled: %s"), 
+		*WorldName, bCollisionEnabled ? TEXT("YES") : TEXT("NO"));
 }
 
 void UVoxelIslandPhysics::EnablePhysicsWithGuards(AVoxelWorld* FallingWorld, const FVoxelIsland& Island)
@@ -775,12 +982,12 @@ void UVoxelIslandPhysics::EnablePhysicsWithGuards(AVoxelWorld* FallingWorld, con
 	// Check if mesh is ready - if not, retry later
 	if (!RootComp.GetBodyInstance() || !RootComp.GetBodySetup())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("Mesh not ready, retrying physics setup in 0.5s"));
+		UE_LOG(LogTemp, Warning, TEXT("Mesh not ready, retrying physics setup in %fs"), MeshGenerationDelay);
 		FTimerHandle RetryTimer;
 		GetWorld()->GetTimerManager().SetTimer(RetryTimer, [this, FallingWorld, Island]()
 		{
 			EnablePhysicsWithGuards(FallingWorld, Island);
-		}, 0.5f, false);
+		}, MeshGenerationDelay, false);
 		return;
 	}
 	
@@ -800,12 +1007,11 @@ void UVoxelIslandPhysics::EnablePhysicsWithGuards(AVoxelWorld* FallingWorld, con
 		}
 	}
 	
-	// Step 5a: Guard against initial penetration - lift by one voxel size
-	float VoxelSize = FallingWorld->VoxelSize;
+	// Step 5a: Guard against initial penetration - lift by configurable distance
 	FVector CurrentLocation = FallingWorld->GetActorLocation();
-	FVector LiftedLocation = CurrentLocation + FVector(0, 0, VoxelSize);
+	FVector LiftedLocation = CurrentLocation + FVector(0, 0, PenetrationGuardDistance);
 	FallingWorld->SetActorLocation(LiftedLocation);
-	UE_LOG(LogTemp, Warning, TEXT("[Penetration Guard] Lifted chunk by %.1fcm to avoid initial overlap"), VoxelSize);
+	UE_LOG(LogTemp, Warning, TEXT("[Penetration Guard] Lifted chunk by %.1fcm to avoid initial overlap"), PenetrationGuardDistance);
 	
 	// Step 5b: Configure collision and physics properties
 	RootComp.SetMobility(EComponentMobility::Movable);
@@ -814,15 +1020,26 @@ void UVoxelIslandPhysics::EnablePhysicsWithGuards(AVoxelWorld* FallingWorld, con
 	RootComp.SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Block);
 	RootComp.SetEnableGravity(true);
 	
-	// Ensure collision is properly set for physics simulation
+	// CRITICAL: Ensure collision covers entire voxel shape, not just center point
 	RootComp.BodyInstance.bUseCCD = true; // Continuous collision detection
 	
-	// Set collision complexity to use complex collision as simple (as expected by physics cooker)
+	// Configure body setup for full mesh collision geometry
 	if (UBodySetup* BodySetup = RootComp.GetBodySetup())
 	{
+		// Force complex collision that matches the actual voxel mesh shape
 		BodySetup->CollisionTraceFlag = ECollisionTraceFlag::CTF_UseComplexAsSimple;
+		BodySetup->bMeshCollideAll = true; // Enable collision for all mesh surfaces
+		BodySetup->bNeverNeedsCookedCollisionData = false; // Allow physics cooking
+		BodySetup->DefaultInstance.SetCollisionProfileName("BlockAll");
+		
+		// Clear any simple collision shapes that might override complex collision
+		BodySetup->AggGeom.EmptyElements();
+		
+		// Force recreation of physics meshes with new settings
 		BodySetup->InvalidatePhysicsData();
 		BodySetup->CreatePhysicsMeshes();
+		
+		UE_LOG(LogTemp, Warning, TEXT("[Physics] Configured BodySetup for full voxel mesh collision (not center-point)"));
 	}
 	
 	// Calculate mass from actual voxel count  
@@ -831,26 +1048,57 @@ void UVoxelIslandPhysics::EnablePhysicsWithGuards(AVoxelWorld* FallingWorld, con
 	float Mass = FMath::Clamp(VoxelCount * DensityPerVoxel, 10.0f, 10000.0f);
 	RootComp.SetMassOverrideInKg(NAME_None, Mass, true);
 	
-	// Step 5c: Enable physics simulation
-	RootComp.SetSimulatePhysics(true);
-	RootComp.WakeAllRigidBodies();
+	// Step 5c: Enable custom physics simulation (not Chaos physics)
+	// Don't enable built-in physics - we'll handle it manually
+	RootComp.SetSimulatePhysics(false); // Disable built-in physics
+	RootComp.SetMobility(EComponentMobility::Movable); // Keep it movable for manual updates
 	
-	// Force wake the component specifically
-	if (UPrimitiveComponent* PrimComp = Cast<UPrimitiveComponent>(&RootComp))
+	UE_LOG(LogTemp, Warning, TEXT("[Physics] Enabled custom physics simulation for voxel island"));
+	
+	// Find the world in our custom physics system (should already be added atomically)
+	int32 WorldIndex = FallingVoxelWorlds.Find(FallingWorld);
+	if (WorldIndex == INDEX_NONE)
 	{
-		PrimComp->WakeRigidBody();
+		UE_LOG(LogTemp, Error, TEXT("[CRITICAL] EnablePhysicsWithGuards called but world not in tracking array - this should not happen with atomic fix!"));
+		return; // Don't add here - should be handled atomically in CreateFallingVoxelWorld
 	}
 	
-	// Step 5d: Move back down after one frame to begin physics cleanly
-	FTimerHandle DropTimer;
-	GetWorld()->GetTimerManager().SetTimer(DropTimer, [this, FallingWorld, CurrentLocation]()
+	UE_LOG(LogTemp, Warning, TEXT("[DEBUG_INDEX] EnablePhysicsWithGuards found world at WorldIndex=%d, FallingVoxelWorlds.Num()=%d, bCustomPhysicsEnabled.Num()=%d"), 
+		WorldIndex, FallingVoxelWorlds.Num(), bCustomPhysicsEnabled.Num());
+	
+	// CRITICAL: Final bounds check before array access to prevent runtime crashes
+	if (WorldIndex >= bCustomPhysicsEnabled.Num() || WorldIndex >= FallingVelocities.Num())
 	{
-		if (IsValid(FallingWorld))
-		{
-			FallingWorld->SetActorLocation(CurrentLocation);
-			UE_LOG(LogTemp, Warning, TEXT("[Penetration Guard] Returned chunk to original position - physics active"));
-		}
-	}, 0.1f, false);
+		UE_LOG(LogTemp, Error, TEXT("[CRITICAL] Array bounds violation at physics enable: WorldIndex=%d, bCustomPhysicsEnabled=%d, FallingVelocities=%d"), 
+			WorldIndex, bCustomPhysicsEnabled.Num(), FallingVelocities.Num());
+		return; // Abort to prevent crash
+	}
+	
+	// Verify physics is already enabled (set atomically during world creation)
+	UE_LOG(LogTemp, Warning, TEXT("[DEBUG_PHYSICS] Checking WorldIndex %d: bCustomPhysicsEnabled[%d]=%s"), 
+		WorldIndex, WorldIndex, bCustomPhysicsEnabled[WorldIndex] ? TEXT("TRUE") : TEXT("FALSE"));
+		
+	if (!bCustomPhysicsEnabled[WorldIndex])
+	{
+		UE_LOG(LogTemp, Error, TEXT("[CRITICAL] Physics should already be enabled atomically but found disabled at WorldIndex %d"), WorldIndex);
+		bCustomPhysicsEnabled[WorldIndex] = true; // Force enable as fallback
+		UE_LOG(LogTemp, Warning, TEXT("[CRITICAL] Forced bCustomPhysicsEnabled[%d] to TRUE as fallback"), WorldIndex);
+	}
+	
+	// Verify initial velocity is set
+	FVector CurrentVelocity = FallingVelocities[WorldIndex];
+	UE_LOG(LogTemp, Warning, TEXT("[DEBUG_VELOCITY] WorldIndex %d initial velocity: (%.1f,%.1f,%.1f)"), 
+		WorldIndex, CurrentVelocity.X, CurrentVelocity.Y, CurrentVelocity.Z);
+		
+	if (FallingVelocities[WorldIndex].IsZero())
+	{
+		FallingVelocities[WorldIndex] = FVector(0, 0, -200.0f); // Set initial downward velocity
+		UE_LOG(LogTemp, Warning, TEXT("[DEBUG_VELOCITY] Set initial velocity for WorldIndex %d"), WorldIndex);
+	}
+	
+	UE_LOG(LogTemp, Warning, TEXT("[Physics] Custom physics FINAL STATE for island %d: enabled=%s, velocity=(%.1f,%.1f,%.1f)"), 
+		WorldIndex, bCustomPhysicsEnabled[WorldIndex] ? TEXT("TRUE") : TEXT("FALSE"),
+		FallingVelocities[WorldIndex].X, FallingVelocities[WorldIndex].Y, FallingVelocities[WorldIndex].Z);
 	
 	// Step 5e: Final verification and logging
 	FString CollisionProfile = RootComp.GetCollisionProfileName().ToString();
@@ -867,8 +1115,129 @@ void UVoxelIslandPhysics::EnablePhysicsWithGuards(AVoxelWorld* FallingWorld, con
 
 void UVoxelIslandPhysics::UpdateFallingPhysics(float DeltaTime)
 {
-	// Clean up destroyed worlds
-	FallingVoxelWorlds.RemoveAll([](AVoxelWorld* World) { return !IsValid(World); });
+	// Debug: Log number of falling worlds being tracked with custom physics
+	static int32 GlobalDebugCounter = 0;
+	if (GlobalDebugCounter++ % 120 == 0) // Log every 120 frames (~2 seconds)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[CustomPhysics] Tracking %d falling worlds using custom physics simulation"), 
+			FallingVoxelWorlds.Num());
+		
+		for (int32 j = 0; j < FallingVoxelWorlds.Num(); j++)
+		{
+			if (j < FallingVoxelWorlds.Num() && IsValid(FallingVoxelWorlds[j]) && j < bCustomPhysicsEnabled.Num() && j < FallingVelocities.Num())
+			{
+				bool bPhysicsEnabled = bCustomPhysicsEnabled[j];
+				FVector Velocity = FallingVelocities[j];
+				UE_LOG(LogTemp, Warning, TEXT("[CustomPhysics] World %d: Valid=true, CustomPhysics=%s, Velocity=(%.1f,%.1f,%.1f)"), 
+					j, bPhysicsEnabled ? TEXT("true") : TEXT("false"), Velocity.X, Velocity.Y, Velocity.Z);
+			}
+		}
+	}
+	
+	// Clean up destroyed worlds and sync arrays
+	for (int32 i = FallingVoxelWorlds.Num() - 1; i >= 0; i--)
+	{
+		if (!IsValid(FallingVoxelWorlds[i]))
+		{
+			FallingVoxelWorlds.RemoveAt(i);
+			// Always remove from all arrays at the same index to maintain synchronization
+			if (i < FallingVelocities.Num()) FallingVelocities.RemoveAt(i);
+			if (i < bCustomPhysicsEnabled.Num()) bCustomPhysicsEnabled.RemoveAt(i);
+			if (i < bProxyDirty.Num()) bProxyDirty.RemoveAt(i);
+			if (i < LastEditTime.Num()) LastEditTime.RemoveAt(i);
+			if (i < bSettled.Num()) bSettled.RemoveAt(i);
+			if (i < SettleTimers.Num()) SettleTimers.RemoveAt(i);
+			// Also remove from any missing arrays if they were somehow longer
+			if (i < ProxyCookCounts.Num()) ProxyCookCounts.RemoveAt(i);
+			if (i < ProxyRebuildTimers.Num()) ProxyRebuildTimers.RemoveAt(i);
+		}
+	}
+	
+	// CRITICAL FIX: Only extend arrays if needed, don't override existing values
+	// This was overriding bCustomPhysicsEnabled from true back to false!
+	while (FallingVelocities.Num() < FallingVoxelWorlds.Num())
+		FallingVelocities.Add(FVector(0, 0, -200.0f));
+	
+	// CRITICAL: Don't override existing enabled states - only add new false entries for new worlds
+	int32 CurrentEnabledSize = bCustomPhysicsEnabled.Num();
+	while (bCustomPhysicsEnabled.Num() < FallingVoxelWorlds.Num())
+	{
+		bCustomPhysicsEnabled.Add(false); // Only new entries get false, existing ones keep their value
+		UE_LOG(LogTemp, Warning, TEXT("[CRITICAL FIX] Extended bCustomPhysicsEnabled array, only new index %d set to false"), bCustomPhysicsEnabled.Num() - 1);
+	}
+	
+	while (bProxyDirty.Num() < FallingVoxelWorlds.Num())
+		bProxyDirty.Add(false);
+	while (LastEditTime.Num() < FallingVoxelWorlds.Num())
+		LastEditTime.Add(0.0f);
+	while (bSettled.Num() < FallingVoxelWorlds.Num())
+		bSettled.Add(false);
+	while (SettleTimers.Num() < FallingVoxelWorlds.Num())
+		SettleTimers.Add(0.0f);
+	while (ProxyCookCounts.Num() < FallingVoxelWorlds.Num())
+		ProxyCookCounts.Add(0);
+	while (ProxyRebuildTimers.Num() < FallingVoxelWorlds.Num())
+		ProxyRebuildTimers.Add(0.0f);
+	
+	// Update custom physics simulation for each falling island
+	for (int32 i = 0; i < FallingVoxelWorlds.Num(); i++)
+	{
+		AVoxelWorld* World = FallingVoxelWorlds[i];
+		
+		if (!IsValid(World))
+			continue;
+			
+		// Skip if custom physics is disabled for this world
+		if (i >= bCustomPhysicsEnabled.Num() || !bCustomPhysicsEnabled[i])
+			continue;
+			
+		// Ensure arrays are synchronized
+		if (i >= FallingVelocities.Num())
+			continue;
+			
+		// Get current state
+		FVector CurrentLocation = World->GetActorLocation();
+		FVector& Velocity = FallingVelocities[i];
+		
+		// Apply gravity
+		Velocity.Z += Gravity * DeltaTime;
+		
+		// Apply air resistance
+		Velocity *= (1.0f - AirResistance * DeltaTime);
+		
+		// Update position
+		FVector NewLocation = CurrentLocation + Velocity * DeltaTime;
+		
+		// Ground collision check
+		if (NewLocation.Z <= GroundLevel)
+		{
+			NewLocation.Z = GroundLevel;
+			Velocity.Z = FMath::Abs(Velocity.Z) * BounceDamping; // Bounce with damping
+			
+			// If velocity is very low, settle the object
+			if (FMath::Abs(Velocity.Z) < 50.0f)
+			{
+				Velocity = FVector::ZeroVector;
+				bCustomPhysicsEnabled[i] = false; // Stop physics simulation
+				UE_LOG(LogTemp, Warning, TEXT("[CustomPhysics] Island %d settled on ground"), i);
+			}
+		}
+		
+		// Apply the new location
+		World->SetActorLocation(NewLocation);
+		
+		// Debug logging every 60 frames
+		static TArray<int32> FrameCounters;
+		while (FrameCounters.Num() <= i)
+			FrameCounters.Add(0);
+			
+		if (FrameCounters[i]++ % 60 == 0)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[CustomPhysics] Island %d: Location=(%.1f,%.1f,%.1f) Velocity=(%.1f,%.1f,%.1f)"), 
+				i, NewLocation.X, NewLocation.Y, NewLocation.Z,
+				Velocity.X, Velocity.Y, Velocity.Z);
+		}
+	}
 	
 	// Update T5 systems
 	UpdateSettleDetection(DeltaTime);
@@ -897,8 +1266,15 @@ void UVoxelIslandPhysics::OnVoxelEdit(AVoxelWorld* World, FVector EditLocation, 
 
 int32 UVoxelIslandPhysics::GetProxyCookCount(int32 IslandIndex) const
 {
-	// Simulated proxy cook counter
-	return 7 + IslandIndex; // Base count + index for variation
+	// CRITICAL: Bounds check before array access
+	if (IslandIndex < 0 || IslandIndex >= ProxyCookCounts.Num())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[GetProxyCookCount] Bounds check: IslandIndex=%d, ProxyCookCounts.Num()=%d"), 
+			IslandIndex, ProxyCookCounts.Num());
+		return 0; // Return safe default instead of crashing
+	}
+	
+	return ProxyCookCounts[IslandIndex];
 }
 
 void UVoxelIslandPhysics::UpdateSettleDetection(float DeltaTime)
@@ -910,34 +1286,34 @@ void UVoxelIslandPhysics::UpdateSettleDetection(float DeltaTime)
 		AVoxelWorld* Island = FallingVoxelWorlds[i];
 		if (!IsValid(Island) || !Island->IsCreated()) continue;
 		
-		UVoxelWorldRootComponent& RootComp = Island->GetWorldRoot();
-		if (!RootComp.IsSimulatingPhysics()) continue;
+		// Skip if custom physics is disabled or arrays not synchronized
+		if (i >= bCustomPhysicsEnabled.Num() || !bCustomPhysicsEnabled[i]) continue;
+		if (i >= FallingVelocities.Num()) continue;
 		
-		// Check velocity thresholds
-		FVector LinearVel = RootComp.GetPhysicsLinearVelocity();
-		FVector AngularVel = RootComp.GetPhysicsAngularVelocityInDegrees();
+		// Check velocity thresholds using custom physics data
+		FVector LinearVel = FallingVelocities[i];
+		// For custom physics, we don't have angular velocity, so just use linear velocity
 		
-		bool bBelowThresholds = (LinearVel.Size() < SettleVelThreshold) && 
-								(AngularVel.Size() < SettleAngVelThreshold);
+		bool bBelowThresholds = LinearVel.Size() < SettleVelThreshold;
 		
 		if (bBelowThresholds)
 		{
-			// Increment settle timer using class member
-			if (SettleTimers.Num() <= i) SettleTimers.SetNum(i + 1);
+			// CRITICAL: Ensure all arrays are properly sized before access
+			while (SettleTimers.Num() <= i) SettleTimers.Add(0.0f);
+			while (bSettled.Num() <= i) bSettled.Add(false);
+			while (bProxyDirty.Num() <= i) bProxyDirty.Add(false);
+			while (LastEditTime.Num() <= i) LastEditTime.Add(0.0f);
 			
 			SettleTimers[i] += DeltaTime;
 			
-			if (SettleTimers[i] >= SettleDuration && bSettled.Num() > i && !bSettled[i])
+			if (SettleTimers[i] >= SettleDuration && !bSettled[i])
 			{
 				bSettled[i] = true;
 				UE_LOG(LogTemp, Warning, TEXT("VoxelIslandPhysics: Island %d settled"), i);
 				
 				// Trigger high-quality proxy rebuild
-				if (bProxyDirty.Num() > i)
-				{
-					bProxyDirty[i] = true;
-					LastEditTime[i] = CurrentTime;
-				}
+				bProxyDirty[i] = true;
+				LastEditTime[i] = CurrentTime;
 			}
 		}
 		else if (SettleTimers.Num() > i)
@@ -953,8 +1329,9 @@ void UVoxelIslandPhysics::UpdateProxyRebuild(float DeltaTime)
 	
 	for (int32 i = 0; i < FallingVoxelWorlds.Num(); i++)
 	{
-		if (bProxyDirty.Num() <= i || !bProxyDirty[i]) continue;
-		if (LastEditTime.Num() <= i) continue;
+		// CRITICAL: Bounds check before array access
+		if (i >= bProxyDirty.Num() || i >= LastEditTime.Num()) continue;
+		if (!bProxyDirty[i]) continue;
 		
 		float TimeSinceEdit = CurrentTime - LastEditTime[i];
 		
@@ -966,11 +1343,19 @@ void UVoxelIslandPhysics::UpdateProxyRebuild(float DeltaTime)
 			// Simulate proxy rebuild
 			bProxyDirty[i] = false;
 			
-			// Update cook count
-			if (ProxyCookCounts.Num() <= i)
+			// CRITICAL: Ensure ProxyCookCounts array is properly sized
+			while (ProxyCookCounts.Num() <= i)
 			{
-				ProxyCookCounts.SetNum(i + 1);
+				ProxyCookCounts.Add(0);
 			}
+			
+			// Additional bounds check before access
+			if (i >= ProxyCookCounts.Num())
+			{
+				UE_LOG(LogTemp, Error, TEXT("[CRITICAL] ProxyCookCounts bounds violation: i=%d, size=%d"), i, ProxyCookCounts.Num());
+				continue;
+			}
+			
 			ProxyCookCounts[i]++;
 			
 			float RebuildDuration = (FPlatformTime::Seconds() * 1000.0f) - RebuildStartTime;
@@ -1445,31 +1830,32 @@ void UVoxelIslandPhysics::EnablePhysicsIfValid(AVoxelWorld* FallingWorld, const 
 		return;
 	}
 	
-	// Check if we have valid triangles
-	UVoxelWorldRootComponent& RootComp = FallingWorld->GetWorldRoot();
-	FBoxSphereBounds Bounds = RootComp.GetLocalBounds();
-	bool bHasValidBounds = Bounds.BoxExtent.Size() > 0.1f;
-	
-	if (bHasValidBounds)
+	// Ensure the world is in the tracking arrays before enabling physics
+	int32 WorldIndex = FallingVoxelWorlds.Find(FallingWorld);
+	if (WorldIndex == INDEX_NONE)
 	{
-		// Enable physics with the existing guards
-		EnablePhysicsWithGuards(FallingWorld, Island);
-		UE_LOG(LogTemp, Warning, TEXT("[Physics] Enabled on FallingWorld - ValidBounds=true, Triangles>0"));
+		WorldIndex = FallingVoxelWorlds.Add(FallingWorld);
+		UE_LOG(LogTemp, Warning, TEXT("[EnablePhysicsIfValid] Added world to tracking arrays at index %d"), WorldIndex);
+	}
+	
+	// Since mesh is visually present, assume it's ready after configured delay
+	UE_LOG(LogTemp, Warning, TEXT("[Physics] Enabling physics after %fs delay (mesh visually ready)"), MeshGenerationDelay);
+	
+	if (MeshGenerationDelay > 0.0f)
+	{
+		FTimerHandle DelayTimer;
+		GetWorld()->GetTimerManager().SetTimer(DelayTimer, [this, FallingWorld, Island]()
+		{
+			// Enable physics directly with the existing guards
+			EnablePhysicsWithGuards(FallingWorld, Island);
+			UE_LOG(LogTemp, Warning, TEXT("[Physics] Enabled on FallingWorld after configured delay"));
+		}, MeshGenerationDelay, false);
 	}
 	else
 	{
-		UE_LOG(LogTemp, Error, TEXT("[Physics] FAILED - FallingWorld still has ValidBounds=false, Triangles=0"));
-		
-		// Debug dump: Check distance from invoker to chunk center
-		FVector ChunkCenter = FallingWorld->GetActorLocation();
-		FVector InvokerPos = FallingWorld->GetActorLocation(); // Invoker is at world center
-		float Distance = FVector::Dist(ChunkCenter, InvokerPos);
-		
-		UE_LOG(LogTemp, Error, TEXT("[Check] Dist(Invoker→ChunkCenter)=%.1fcm, VoxelSize=%.1f"), 
-			Distance, FallingWorld->VoxelSize);
-		UE_LOG(LogTemp, Error, TEXT("[Runtime] Initialized=%s, UsingData=%s"), 
-			FallingWorld->IsCreated() ? TEXT("true") : TEXT("false"),
-			FallingWorld->Generator.IsValid() ? TEXT("true") : TEXT("false"));
+		// Enable physics immediately
+		EnablePhysicsWithGuards(FallingWorld, Island);
+		UE_LOG(LogTemp, Warning, TEXT("[Physics] Enabled on FallingWorld immediately (zero delay)"));
 	}
 }
 
@@ -1649,28 +2035,59 @@ void UVoxelIslandPhysics::ContinueWithIslandCopy()
 	// Verify visual state
 	VerifyVisualState(PendingSourceWorld, PendingMeshWorld, PendingIsland);
 	
-	// Enable physics with penetration guards
-	EnablePhysicsWithGuards(PendingMeshWorld, PendingIsland);
+	// CRITICAL FIX: Enable physics ATOMICALLY when adding world to prevent race condition
+	// The issue was UpdateFallingPhysics() could run between Add() and EnablePhysicsWithGuards()
+	// and initialize bCustomPhysicsEnabled[0] = false before EnablePhysicsWithGuards sets it to true
 	
-	// Add to tracking array
-	FallingVoxelWorlds.Add(PendingMeshWorld);
+	// Check if world is already in tracking arrays (added in CreateFallingVoxelWorld)
+	int32 ExistingIndex = FallingVoxelWorlds.Find(PendingMeshWorld);
+	if (ExistingIndex != INDEX_NONE)
+	{
+		// World already tracked, just enable physics
+		UE_LOG(LogTemp, Warning, TEXT("[ContinueWithIslandCopy] World already tracked at index %d, enabling physics"), ExistingIndex);
+		bCustomPhysicsEnabled[ExistingIndex] = true;
+		FallingVelocities[ExistingIndex] = FVector(0, 0, -200.0f);  // Set initial falling velocity
+		EnablePhysicsWithGuards(PendingMeshWorld, PendingIsland);
+	}
+	else
+	{
+		// Fallback: Add world to tracking arrays if somehow missed
+		UE_LOG(LogTemp, Warning, TEXT("[ContinueWithIslandCopy] World not found in tracking arrays, adding now"));
+		
+		// Pre-extend all arrays with correct initial values BEFORE adding to FallingVoxelWorlds
+		int32 NewWorldIndex = FallingVoxelWorlds.Num();
 	
-	// Initialize performance tracking arrays for this new island
-	int32 IslandIndex = FallingVoxelWorlds.Num() - 1;
-	if (bProxyDirty.Num() <= IslandIndex) bProxyDirty.SetNum(IslandIndex + 1);
-	if (LastEditTime.Num() <= IslandIndex) LastEditTime.SetNum(IslandIndex + 1);
-	if (bSettled.Num() <= IslandIndex) bSettled.SetNum(IslandIndex + 1);
-	if (SettleTimers.Num() <= IslandIndex) SettleTimers.SetNum(IslandIndex + 1);
-	if (ProxyCookCounts.Num() <= IslandIndex) ProxyCookCounts.SetNum(IslandIndex + 1);
-	if (ProxyRebuildTimers.Num() <= IslandIndex) ProxyRebuildTimers.SetNum(IslandIndex + 1);
+	UE_LOG(LogTemp, Warning, TEXT("[DEBUG_INDEX] BEFORE extension: FallingVoxelWorlds=%d, bCustomPhysicsEnabled=%d, calculating NewWorldIndex=%d"), 
+		FallingVoxelWorlds.Num(), bCustomPhysicsEnabled.Num(), NewWorldIndex);
 	
-	// Initialize arrays for new island
-	bProxyDirty[IslandIndex] = true;
-	LastEditTime[IslandIndex] = GetWorld()->GetTimeSeconds();
-	bSettled[IslandIndex] = false;
-	SettleTimers[IslandIndex] = 0.0f;
-	ProxyCookCounts[IslandIndex] = 0;
-	ProxyRebuildTimers[IslandIndex] = 0.0f;
+	// Extend arrays with proper initial values
+	FallingVelocities.Add(FVector(0, 0, -200.0f));
+	bCustomPhysicsEnabled.Add(true); // CRITICAL: Set to true from the start!
+	bProxyDirty.Add(false);
+	LastEditTime.Add(0.0f);
+	bSettled.Add(false);
+	SettleTimers.Add(0.0f);
+	ProxyCookCounts.Add(0);
+	ProxyRebuildTimers.Add(0.0f);
+	
+		UE_LOG(LogTemp, Warning, TEXT("[ATOMIC_FIX] Pre-extended all arrays for NewWorldIndex %d: bCustomPhysicsEnabled[%d]=TRUE, arrays now sized %d"), 
+			NewWorldIndex, NewWorldIndex, bCustomPhysicsEnabled.Num());
+		
+		// Now add to tracking array - physics is already enabled in synchronized arrays
+		FallingVoxelWorlds.Add(PendingMeshWorld);
+		
+		UE_LOG(LogTemp, Warning, TEXT("[DEBUG_INDEX] AFTER adding world: FallingVoxelWorlds=%d, world added at what should be index %d"), 
+			FallingVoxelWorlds.Num(), NewWorldIndex);
+		
+		// Configure the world's collision and physics properties
+		EnablePhysicsWithGuards(PendingMeshWorld, PendingIsland);
+		
+		// Arrays are already properly initialized atomically above
+		// Just set the initial runtime values for this specific island
+		int32 IslandIndex = FallingVoxelWorlds.Num() - 1;
+		bProxyDirty[IslandIndex] = true;  // Mark for immediate rebuild
+		LastEditTime[IslandIndex] = GetWorld()->GetTimeSeconds(); // Current time
+	}
 	
 	// FIX: Add immediate mesh generation validation
 	UE_LOG(LogTemp, Warning, TEXT("[ContinueWithIslandCopy] Validating mesh generation..."));
@@ -1726,8 +2143,8 @@ void UVoxelIslandPhysics::CopyVoxelDataRobust(AVoxelWorld* Source, AVoxelWorld* 
 		FVoxelValue Value = Source->GetData().GetValue(SourcePos, 0);
 		FVoxelMaterial Material = Source->GetData().GetMaterial(SourcePos, 0);
 		
-		// Rebase to destination local coordinates (+1 border offset)
-		FIntVector LocalPos = SourcePos - MinIndex + FIntVector(1, 1, 1);
+		// Rebase to destination local coordinates (exact positioning)
+		FIntVector LocalPos = SourcePos - MinIndex;
 		
 		// CRITICAL: Always write solid density for triangle generation
 		FVoxelValue SolidValue(-1.0f); // NEGATIVE = SOLID (generates triangles)

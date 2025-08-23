@@ -50,11 +50,15 @@ public:
 
 	// Configurable delay for mesh generation (in seconds)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel Physics", meta = (ClampMin = "0.0", ClampMax = "10.0"))
-	float MeshGenerationDelay = 0.2f;
+	float MeshGenerationDelay = 0.0f;
 
 	// Maximum attempts to check for mesh generation (total wait time = MaxMeshAttempts * 0.1s)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel Physics", meta = (ClampMin = "10", ClampMax = "200"))
 	int32 MaxMeshAttempts = 100; // Default 10 seconds
+
+	// Distance to lift voxel worlds to prevent initial penetration (in cm)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel Physics", meta = (ClampMin = "0.0", ClampMax = "1000.0"))
+	float PenetrationGuardDistance = 500.0f; // Default 5 meters
 
 	// Timer callback for checking mesh generation completion
 	UFUNCTION()
@@ -81,9 +85,14 @@ private:
 	
 	// Rebuild collision on a world after voxel changes
 	void RebuildWorldCollision(AVoxelWorld* World, const FString& WorldName);
+	void RebuildWorldCollisionIncremental(AVoxelWorld* World, const FString& WorldName);
+	void RebuildWorldCollisionRegional(AVoxelWorld* World, const FVoxelIsland& Island, const FString& WorldName);
 	
 	// Enable physics on a falling voxel world with penetration guards
 	void EnablePhysicsWithGuards(AVoxelWorld* FallingWorld, const FVoxelIsland& Island);
+	
+	// Validate that collision geometry covers the full voxel shape
+	void ValidateVoxelCollision(AVoxelWorld* World, const FString& WorldName);
 	
 	// Check if voxel exists at position
 	bool HasVoxelAt(AVoxelWorld* World, const FIntVector& Position);
@@ -103,8 +112,18 @@ private:
 	// Physics update for falling worlds
 	void UpdateFallingPhysics(float DeltaTime);
 	
-	// Ground check threshold
-	float GroundLevel = -500.0f;
+	// Custom physics simulation variables
+	UPROPERTY()
+	TArray<FVector> FallingVelocities;
+	
+	UPROPERTY()
+	TArray<bool> bCustomPhysicsEnabled;
+	
+	// Physics constants
+	float Gravity = -980.0f; // cm/s^2 (realistic gravity)
+	float AirResistance = 0.02f; // drag coefficient
+	float GroundLevel = 0.0f; // Ground check threshold
+	float BounceDamping = 0.3f; // Energy loss on bounce
 
 	// T5/T6 scaffolds
 	UPROPERTY()
