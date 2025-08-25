@@ -341,7 +341,7 @@ void UVoxelToolComponent::BuildFromPlayerView()
 
 void UVoxelToolComponent::IncreaseToolSize()
 {
-	ToolRadius = FMath::Clamp(ToolRadius + 50.0f, 50.0f, 650.0f);
+	ToolRadius = FMath::Clamp(ToolRadius + 50.0f, 100.0f, 500.0f);
 	UE_LOG(LogTemp, Log, TEXT("Tool radius increased to: %f"), ToolRadius);
 	
 	// Show message to player
@@ -354,7 +354,7 @@ void UVoxelToolComponent::IncreaseToolSize()
 
 void UVoxelToolComponent::DecreaseToolSize()
 {
-	ToolRadius = FMath::Clamp(ToolRadius - 50.0f, 50.0f, 650.0f);
+	ToolRadius = FMath::Clamp(ToolRadius - 50.0f, 100.0f, 500.0f);
 	UE_LOG(LogTemp, Log, TEXT("Tool radius decreased to: %f"), ToolRadius);
 	
 	// Show message to player

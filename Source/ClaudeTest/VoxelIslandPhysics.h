@@ -209,7 +209,7 @@ public:
 
 	// Maximum build height in world units (prevents building above this Z coordinate)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Build Constraints", meta = (ClampMin = "1000.0", ClampMax = "20000.0"))
-	float MaxBuildHeight = 3500.0f;
+	float MaxBuildHeight = 3200.0f;
 
 private:
 	

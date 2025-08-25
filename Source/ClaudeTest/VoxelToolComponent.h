@@ -47,7 +47,7 @@ public:
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
 	// Tool settings
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel Tools", meta = (ClampMin = "100.0", ClampMax = "300.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel Tools", meta = (ClampMin = "100.0", ClampMax = "500.0"))
 	float ToolRadius = 200.0f;
 
 
