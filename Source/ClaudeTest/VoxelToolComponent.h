@@ -134,6 +134,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel Physics", meta = (ToolTip = "Enable automatic physics for floating parts after digging"))
 	bool bEnableVoxelPhysics = true;
 
+	// Use fast physics mode during digging to prevent lag while still enabling island creation
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel Physics", meta = (ToolTip = "Use fast physics mode during digging to prevent lag while still enabling island creation"))
+	bool bUseFastPhysicsOnDig = true;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel Physics", meta = (ClampMin = "1", ClampMax = "10", ToolTip = "Minimum number of connected voxels before they fall with physics (1 = all disconnected parts fall, 10 = only small parts fall)"))
 	int32 MinPartsForPhysics = 1;
 

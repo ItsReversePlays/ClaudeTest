@@ -44,6 +44,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Voxel Physics")
 	void CheckForDisconnectedIslands(AVoxelWorld* World, FVector EditLocation, float EditRadius);
 
+	// Fast version with reduced search parameters for digging operations
+	UFUNCTION(BlueprintCallable, Category = "Voxel Physics")
+	void CheckForDisconnectedIslandsFast(AVoxelWorld* World, FVector EditLocation, float EditRadius);
+
 	// Get falling voxel worlds for testing
 	UFUNCTION(BlueprintCallable, Category = "Voxel Physics")
 	const TArray<AVoxelWorld*>& GetFallingVoxelWorlds() const { return FallingVoxelWorlds; }
@@ -202,6 +206,10 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Island Detection", meta = (ClampMin = "1000", ClampMax = "100000"))
 	int32 MaxIslandVoxels = 10000;
+
+	// Maximum build height in world units (prevents building above this Z coordinate)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Build Constraints", meta = (ClampMin = "1000.0", ClampMax = "20000.0"))
+	float MaxBuildHeight = 3500.0f;
 
 private:
 	

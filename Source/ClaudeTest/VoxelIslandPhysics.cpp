@@ -142,6 +142,40 @@ void UVoxelIslandPhysics::CheckForDisconnectedIslands(AVoxelWorld* World, FVecto
 	}
 }
 
+void UVoxelIslandPhysics::CheckForDisconnectedIslandsFast(AVoxelWorld* World, FVector EditLocation, float EditRadius)
+{
+	if (!World || !World->IsCreated())
+	{
+		return;
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("VoxelIslandPhysics: Fast island check at %s"), *EditLocation.ToString());
+	
+	// Store original values
+	int32 OriginalMaxFloodFill = MaxFloodFillIterations;
+	int32 OriginalMaxTotalVoxels = MaxTotalVoxels;
+	int32 OriginalMaxQuickScan = MaxQuickScanVoxels;
+	float OriginalTowerHeight = TowerHeightLimit;
+	float OriginalHorizontalLimit = HorizontalStructureLimit;
+	
+	// Use much smaller limits for fast detection
+	MaxFloodFillIterations = 5000;    // Reduced from default 50000
+	MaxTotalVoxels = 2500000;         // Reduced from default 25000000
+	MaxQuickScanVoxels = 10000;       // Reduced from default 100000
+	TowerHeightLimit = 2500.0f;       // Reduced from default 5000
+	HorizontalStructureLimit = 4000.0f; // Reduced from default 8000
+	
+	// Call regular detection with reduced parameters
+	CheckForDisconnectedIslands(World, EditLocation, EditRadius);
+	
+	// Restore original values
+	MaxFloodFillIterations = OriginalMaxFloodFill;
+	MaxTotalVoxels = OriginalMaxTotalVoxels;
+	MaxQuickScanVoxels = OriginalMaxQuickScan;
+	TowerHeightLimit = OriginalTowerHeight;
+	HorizontalStructureLimit = OriginalHorizontalLimit;
+}
+
 TArray<FVoxelIsland> UVoxelIslandPhysics::DetectIslands(AVoxelWorld* World, const FIntVector& EditMin, const FIntVector& EditMax)
 {
 	TArray<FVoxelIsland> Islands;

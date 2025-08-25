@@ -609,6 +609,14 @@ void UVoxelToolComponent::LocalBuildAtLocation(FVector Location, float Radius, f
 		return;
 	}
 
+	// Check max build height constraint
+	if (IslandPhysicsComponent && Location.Z > IslandPhysicsComponent->MaxBuildHeight)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("VoxelToolComponent: Build blocked - location Z=%.1f exceeds MaxBuildHeight=%.1f"), 
+			Location.Z, IslandPhysicsComponent->MaxBuildHeight);
+		return;
+	}
+
 	// Gentle strength formula: allows very low strength values for precise control
 	float EffectiveRadius = Radius * FMath::Max(0.1f, Strength * 0.5f);
 	
@@ -694,7 +702,16 @@ void UVoxelToolComponent::LocalDigAtLocation(FVector Location, float Radius, flo
 	// Use the new island physics system to check for disconnected chunks
 	if (IslandPhysicsComponent && bEnableVoxelPhysics)
 	{
-		IslandPhysicsComponent->CheckForDisconnectedIslands(VoxelWorld, Location, EffectiveRadius);
+		if (bUseFastPhysicsOnDig)
+		{
+			// Use fast detection to minimize lag while still enabling island creation
+			IslandPhysicsComponent->CheckForDisconnectedIslandsFast(VoxelWorld, Location, EffectiveRadius);
+		}
+		else
+		{
+			// Use full detection
+			IslandPhysicsComponent->CheckForDisconnectedIslands(VoxelWorld, Location, EffectiveRadius);
+		}
 	}
 }
 
@@ -1045,6 +1062,13 @@ void UVoxelToolComponent::InterpolateBuildPoints(FVector StartLocation, FVector 
 	if (TotalDistance < StepSize)
 	{
 		// Distance too small, just build at end location
+		// Check max build height constraint
+		if (IslandPhysicsComponent && EndLocation.Z > IslandPhysicsComponent->MaxBuildHeight)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("VoxelToolComponent: Build blocked - interpolated location Z=%.1f exceeds MaxBuildHeight=%.1f"), 
+				EndLocation.Z, IslandPhysicsComponent->MaxBuildHeight);
+			return;
+		}
 		UVoxelSphereTools::AddSphere(VoxelWorld, EndLocation, Radius);
 		return;
 	}
@@ -1060,6 +1084,14 @@ void UVoxelToolComponent::InterpolateBuildPoints(FVector StartLocation, FVector 
 	{
 		float Alpha = float(i) / float(NumSteps);
 		FVector InterpolatedLocation = StartLocation + (Direction * ActualStepSize * i);
+		
+		// Check max build height constraint for each interpolated point
+		if (IslandPhysicsComponent && InterpolatedLocation.Z > IslandPhysicsComponent->MaxBuildHeight)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("VoxelToolComponent: Interpolated build stopped at step %d/%d - location Z=%.1f exceeds MaxBuildHeight=%.1f"), 
+				i, NumSteps, InterpolatedLocation.Z, IslandPhysicsComponent->MaxBuildHeight);
+			break; // Stop building further points that exceed height limit
+		}
 		
 		// Slightly reduce radius for intermediate points to avoid over-building
 		float InterpolatedRadius = Radius * 0.8f;
